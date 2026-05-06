@@ -3,9 +3,11 @@
 const express = require('express');
 const cors    = require('cors');
 const crypto  = require('crypto');
+const fs      = require('fs');
+const path    = require('path');
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '2mb' }));
 app.use(cors({ origin: '*' }));
 
 const API_KEY    = process.env.BYBIT_API_KEY    || '';
@@ -13,6 +15,11 @@ const API_SECRET = process.env.BYBIT_API_SECRET || '';
 const TESTNET    = (process.env.BYBIT_TESTNET   || 'true') === 'true';
 const PORT       = parseInt(process.env.PORT    || '3001', 10);
 const BASE_URL   = TESTNET ? 'https://api-testnet.bybit.com' : 'https://api.bybit.com';
+const AUTH_TOKEN = process.env.JOURNAL_AUTH_TOKEN || '';
+
+// Small local storage file for journal/signal sync. This survives restarts only if your host keeps the filesystem.
+const DATA_DIR  = process.env.DATA_DIR || path.join(__dirname, 'data');
+const DATA_FILE = path.join(DATA_DIR, 'journal-store.json');
 
 console.log('[Orayan] Mode   :', TESTNET ? 'TESTNET' : 'LIVE');
 console.log('[Orayan] Port   :', PORT);
@@ -23,10 +30,10 @@ function sign(timestamp, recvWindow, payload) {
   return crypto.createHmac('sha256', API_SECRET).update(raw).digest('hex');
 }
 
-async function bybitRequest(method, path, params = {}) {
+async function bybitRequest(method, requestPath, params = {}) {
   const timestamp  = Date.now().toString();
   const recvWindow = '5000';
-  let url = BASE_URL + path;
+  let url = BASE_URL + requestPath;
   let bodyString = '';
   let queryString = '';
 
@@ -66,8 +73,114 @@ function requireKeys(res) {
   return true;
 }
 
+function requireJournalAuth(req, res, next) {
+  if (!AUTH_TOKEN) return next();
+  const given = req.header('X-Auth-Token') || '';
+  if (given !== AUTH_TOKEN) return res.status(401).json({ ok: false, error: 'Invalid X-Auth-Token' });
+  next();
+}
+
+function emptyStore() {
+  return { journal: [], signals: [], updatedAt: Date.now() };
+}
+
+function readStore() {
+  try {
+    if (!fs.existsSync(DATA_FILE)) return emptyStore();
+    const parsed = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    return {
+      journal: Array.isArray(parsed.journal) ? parsed.journal : [],
+      signals: Array.isArray(parsed.signals) ? parsed.signals : [],
+      updatedAt: parsed.updatedAt || Date.now(),
+    };
+  } catch (e) {
+    console.error('[Orayan] Failed reading store:', e.message);
+    return emptyStore();
+  }
+}
+
+function writeStore(store) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.writeFileSync(DATA_FILE, JSON.stringify({ ...store, updatedAt: Date.now() }, null, 2));
+}
+
+function mergeRows(existingRows, incomingRows, limit = 500) {
+  const map = new Map();
+  for (const row of existingRows || []) {
+    if (row && row.id) map.set(row.id, row);
+  }
+  let added = 0;
+  let updated = 0;
+  for (const row of incomingRows || []) {
+    if (!row || !row.id) continue;
+    const old = map.get(row.id);
+    if (!old) {
+      map.set(row.id, row);
+      added += 1;
+    } else if ((row.ts || row.updatedAt || 0) >= (old.ts || old.updatedAt || 0)) {
+      map.set(row.id, { ...old, ...row });
+      updated += 1;
+    }
+  }
+  const rows = [...map.values()].sort((a, b) => (b.ts || b.updatedAt || 0) - (a.ts || a.updatedAt || 0)).slice(0, limit);
+  return { rows, added, updated };
+}
+
+app.get('/', (req, res) => {
+  res.json({ ok: true, mode: TESTNET ? 'testnet' : 'live', keySet: !!(API_KEY && API_SECRET), ts: Date.now() });
+});
+
 app.get('/health', (req, res) => {
   res.json({ ok: true, mode: TESTNET ? 'testnet' : 'live', keySet: !!(API_KEY && API_SECRET), ts: Date.now() });
+});
+
+app.get('/api/status', requireJournalAuth, (req, res) => {
+  const store = readStore();
+  res.json({ ok: true, journalCount: store.journal.length, signalCount: store.signals.length, updatedAt: store.updatedAt });
+});
+
+app.get('/api/journal', requireJournalAuth, (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit || '500', 10) || 500, 1000);
+  const store = readStore();
+  res.json({ ok: true, rows: store.journal.slice(0, limit), journal: store.journal.slice(0, limit), updatedAt: store.updatedAt });
+});
+
+app.post('/api/journal/push', requireJournalAuth, (req, res) => {
+  const incoming = Array.isArray(req.body?.rows) ? req.body.rows : Array.isArray(req.body?.journal) ? req.body.journal : [];
+  const store = readStore();
+  const merged = mergeRows(store.journal, incoming, 500);
+  store.journal = merged.rows;
+  writeStore(store);
+  res.json({ ok: true, rows: store.journal, added: merged.added, updated: merged.updated, count: store.journal.length });
+});
+
+// Extra simple routes in case the app/user tests /journal directly.
+app.get('/journal', requireJournalAuth, (req, res) => {
+  const store = readStore();
+  res.json({ ok: true, rows: store.journal, journal: store.journal, updatedAt: store.updatedAt });
+});
+
+app.post('/journal', requireJournalAuth, (req, res) => {
+  const incoming = Array.isArray(req.body?.rows) ? req.body.rows : Array.isArray(req.body?.journal) ? req.body.journal : [];
+  const store = readStore();
+  const merged = mergeRows(store.journal, incoming, 500);
+  store.journal = merged.rows;
+  writeStore(store);
+  res.json({ ok: true, added: merged.added, updated: merged.updated, count: store.journal.length });
+});
+
+app.get('/api/signals', requireJournalAuth, (req, res) => {
+  const store = readStore();
+  res.json(store.signals || []);
+});
+
+app.post('/api/signals', requireJournalAuth, (req, res) => {
+  const incoming = Array.isArray(req.body?.signals) ? req.body.signals : Array.isArray(req.body) ? req.body : [];
+  const store = readStore();
+  const merged = mergeRows(store.signals, incoming, 1000);
+  store.signals = merged.rows;
+  writeStore(store);
+  res.json({ ok: true, added: merged.added, updated: merged.updated, count: store.signals.length });
 });
 
 app.post('/bybit/order', async (req, res) => {
@@ -170,4 +283,4 @@ app.get('/bybit/order-status', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log('[Orayan] Proxy running on port', PORT));
+app.listen(PORT, '0.0.0.0', () => console.log('[Orayan] Proxy running on port', PORT));
